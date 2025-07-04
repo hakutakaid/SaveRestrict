@@ -76,7 +76,6 @@ To run the bot, you'll need to configure a few sensitive variables. Here's how t
 - **`OWNER_ID`**: Use [@missrose_bot](https://t.me/missrose_bot) to get your user ID by sending `/info`.
 - **`CHANNEL_ID`**: The ID of the channel for forced subscription.
 - **`LOG_GROUP`**: A group or channel where the bot logs messages. Forward a message to [@userinfobot](https://t.me/userinfobot) to get your channel/group ID.
-- **`MONGO_DB`**: A MongoDB URL for storing session data (recommended for security).
   
 ### Additional Configuration Options:
 - **`STRING`**: (Optional) Add your **premium account session string** here to allow 4GB file uploads. This is **optional** and can be left empty if not used.
