@@ -5,74 +5,79 @@ import re
 import cv2
 import logging
 import asyncio
-import aiosqlite # Import aiosqlite
+import aiosqlite
 from datetime import datetime, timedelta
-
-# Hapus import motor dan config yang berkaitan dengan MongoDB
-# from motor.motor_asyncio import AsyncIOMotorClient
-# from config import MONGO_DB as MONGO_URI, DB_NAME
+import json # Import json for serialization/deserialization
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# It's better to define DB_PATH in config.py and import it,
+# but for now, we'll keep it here as in your provided code.
+DB_PATH = 'data.db' 
 
 PUBLIC_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/([^/]+)(/(\d+))?')
 PRIVATE_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/c/(\d+)(/(\d+))?')
 VIDEO_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mpeg", "mpg", "3gp"}
 
-# Konfigurasi Database SQLite
-# Anda perlu mendefinisikan lokasi database SQLite, misalnya di config.py atau langsung di sini
-DB_PATH = 'data.db' # Ganti dengan path yang Anda inginkan, bisa dari config.py
-
 class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = db_path
-        self._conn = None # Untuk menyimpan koneksi database
+        self._conn = None # To hold the database connection
 
     async def connect(self):
-        """Membuat koneksi ke database jika belum ada."""
+        """Establishes database connection if not already open."""
         if self._conn is None:
+            # Ensure the directory for the database file exists
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+            
             self._conn = await aiosqlite.connect(self.db_path)
-            self._conn.row_factory = aiosqlite.Row # Mengatur row_factory agar hasil query bisa diakses seperti dict
+            self._conn.row_factory = aiosqlite.Row # Allows accessing columns by name (like a dict)
 
-            # Inisialisasi tabel jika belum ada
+            # Initialize tables if they don't exist
             await self._create_tables()
 
     async def close(self):
-        """Menutup koneksi database."""
+        """Closes the database connection."""
         if self._conn:
             await self._conn.close()
             self._conn = None
 
     async def _execute(self, query, params=()):
-        """Mengeksekusi query database dan mengembalikan cursor."""
-        await self.connect() # Pastikan koneksi terbuka
+        """Executes a database query and returns the cursor."""
+        await self.connect() # Ensure connection is open
         try:
             cursor = await self._conn.execute(query, params)
             await self._conn.commit()
             return cursor
         except Exception as e:
             logger.error(f"Error executing query: {query} with params {params} - {e}")
-            raise # Re-raise exception untuk penanganan lebih lanjut
+            raise # Re-raise exception for further handling
 
     async def _fetchone(self, query, params=()):
-        """Mengeksekusi query dan mengembalikan satu baris."""
+        """Executes a query and returns a single row."""
         cursor = await self._execute(query, params)
         return await cursor.fetchone()
 
     async def _fetchall(self, query, params=()):
-        """Mengeksekusi query dan mengembalikan semua baris."""
+        """Executes a query and returns all rows."""
         cursor = await self._execute(query, params)
         return await cursor.fetchall()
 
     async def _create_tables(self):
-        """Membuat tabel yang diperlukan jika belum ada."""
+        """Creates necessary tables if they don't exist."""
         await self._execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 session_string TEXT,
                 bot_token TEXT,
-                replacement_words TEXT, -- Simpan sebagai JSON string
-                delete_words TEXT,      -- Simpan sebagai JSON string
+                chat_id TEXT,             -- Added for "no such column" error fix
+                rename_tag TEXT,          -- Added for "no such column" error fix
+                caption TEXT,             -- Added for "no such column" error fix
+                replacement_words TEXT,   -- Stored as JSON string
+                delete_words TEXT,        -- Stored as JSON string
                 updated_at DATETIME
             )
         ''')
@@ -80,20 +85,22 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS premium_users (
                 user_id INTEGER PRIMARY KEY,
                 subscription_start DATETIME,
-                subscription_end DATETIME
+                subscription_end DATETIME,
+                expireAt DATETIME,         -- Keep for compatibility if used elsewhere, though not for TTL
+                transferred_from INTEGER,
+                transferred_from_name TEXT
             )
         ''')
-        # SQLite tidak memiliki fitur TTL (Time-To-Live) index seperti MongoDB.
-        # Anda perlu membersihkan user premium kadaluarsa secara manual atau dengan cron job terpisah.
-        # Kolom expireAt di MongoDB adalah untuk TTL, di SQLite kita akan pakai subscription_end
+        # SQLite doesn't have TTL (Time-To-Live) index like MongoDB.
+        # You need to clean up expired premium users manually or with a separate cron job.
         
         await self._execute('''
             CREATE TABLE IF NOT EXISTS statistics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT,
-                timestamp DATETIME,
+                timestamp DATETIME, -- Ensure this stores string representation of datetime
                 user_id INTEGER
-                -- Tambahkan kolom statistik lainnya sesuai kebutuhan Anda
+                -- Add other statistics columns as needed
             )
         ''')
         await self._execute('''
@@ -107,7 +114,7 @@ class DatabaseManager:
         ''')
         logger.info("Database tables initialized.")
 
-    # Metode untuk mengakses 'collections'
+    # Methods to access 'collections'
     async def get_users_collection(self):
         return UsersCollection(self)
 
@@ -120,10 +127,10 @@ class DatabaseManager:
     async def get_codedb_collection(self):
         return RedeemCodeCollection(self)
 
-# Inisialisasi DatabaseManager global
+# Global DatabaseManager instance
 db_manager = DatabaseManager(DB_PATH)
 
-# Kelas-kelas pembantu untuk 'collections' agar panggilan tetap mirip
+# Helper classes for 'collections' to mimic MongoDB calls
 class UsersCollection:
     def __init__(self, db_manager):
         self.db_manager = db_manager
@@ -136,62 +143,50 @@ class UsersCollection:
         set_fields = update_query.get("$set", {})
         unset_fields = update_query.get("$unset", {})
         
-        # Konversi dict/list ke JSON string untuk penyimpanan
-        if "replacement_words" in set_fields and isinstance(set_fields["replacement_words"], dict):
-            set_fields["replacement_words"] = json.dumps(set_fields["replacement_words"])
-        if "delete_words" in set_fields and isinstance(set_fields["delete_words"], list):
-            set_fields["delete_words"] = json.dumps(set_fields["delete_words"])
+        # Prepare data for insertion/update
+        data_to_set = {}
 
-        # Bangun SET clause
-        set_clauses = [f"{k} = ?" for k in set_fields]
-        set_values = list(set_fields.values())
-
-        # Bangun UNSET (set to NULL) clause
-        unset_clauses = [f"{k} = NULL" for k in unset_fields]
-
-        if set_clauses or unset_clauses:
-            update_parts = []
-            if set_clauses:
-                update_parts.append(", ".join(set_clauses))
-            if unset_clauses:
-                update_parts.append(", ".join(unset_clauses))
-            
-            update_sql = "SET " + ", ".join(update_parts)
-            values = set_values + [user_id]
-            
-            # Cek apakah user_id sudah ada
-            existing_user = await self.db_manager._fetchone("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-            
-            if existing_user:
-                query = f"UPDATE users {update_sql} WHERE user_id = ?"
-                await self.db_manager._execute(query, values)
-            elif upsert:
-                # Untuk upsert, kita harus membangun INSERT atau UPDATE secara manual
-                # Ambil semua kolom yang mungkin di set atau di unset (untuk NULL)
-                columns = []
-                placeholders = []
-                insert_values = []
-                
-                # Tambahkan user_id
-                columns.append("user_id")
-                placeholders.append("?")
-                insert_values.append(user_id)
-
-                for k, v in set_fields.items():
-                    columns.append(k)
-                    placeholders.append("?")
-                    insert_values.append(v)
-                
-                for k in unset_fields:
-                    columns.append(k)
-                    placeholders.append("NULL") # Set to NULL for unset
-
-                insert_sql = f"INSERT OR REPLACE INTO users ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-                await self.db_manager._execute(insert_sql, insert_values)
+        # Handle $set fields
+        for k, v in set_fields.items():
+            if k in ["replacement_words", "delete_words"]:
+                # Serialize dict/list to JSON string for storage
+                if isinstance(v, (dict, list)):
+                    data_to_set[k] = json.dumps(v)
+                else: # Handle cases where it might already be a string or None
+                    data_to_set[k] = v 
             else:
-                logger.warning(f"User {user_id} not found and upsert is false.")
+                data_to_set[k] = v
+
+        # Handle $unset fields by setting them to None
+        for k in unset_fields:
+            data_to_set[k] = None
+
+        # Check if user_id already exists
+        existing_user = await self.db_manager._fetchone("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        
+        if existing_user:
+            # Update existing user
+            update_clauses = []
+            params = []
+            for k, v in data_to_set.items():
+                update_clauses.append(f"{k} = ?")
+                params.append(v)
+            
+            if update_clauses: # Only execute if there's something to update
+                query = f"UPDATE users SET {', '.join(update_clauses)} WHERE user_id = ?"
+                await self.db_manager._execute(query, params + [user_id])
+        elif upsert:
+            # Insert new user or replace existing one if upsert=True
+            # Use INSERT OR REPLACE to handle upsert logic
+            all_fields = {'user_id': user_id, **data_to_set}
+            columns = ', '.join(all_fields.keys())
+            placeholders = ', '.join(['?'] * len(all_fields))
+            values = tuple(all_fields.values())
+            
+            insert_sql = f"INSERT OR REPLACE INTO users ({columns}) VALUES ({placeholders})"
+            await self.db_manager._execute(insert_sql, values)
         else:
-            logger.debug(f"No fields to update for user {user_id}.")
+            logger.warning(f"User {user_id} not found and upsert is false. No operation performed.")
 
     async def find_one(self, filter_query):
         user_id = filter_query.get("user_id")
@@ -201,22 +196,24 @@ class UsersCollection:
         row = await self.db_manager._fetchone("SELECT * FROM users WHERE user_id = ?", (user_id,))
         if row:
             data = dict(row)
-            # Konversi JSON string kembali ke dict/list
-            if 'replacement_words' in data and data['replacement_words']:
-                data['replacement_words'] = json.loads(data['replacement_words'])
-            else:
-                data['replacement_words'] = {} # Pastikan defaultnya dict
-            if 'delete_words' in data and data['delete_words']:
-                data['delete_words'] = json.loads(data['delete_words'])
-            else:
-                data['delete_words'] = [] # Pastikan defaultnya list
+            # Deserialize JSON string back to dict/list
+            for key in ["replacement_words", "delete_words"]:
+                if key in data and data[key] is not None:
+                    try:
+                        data[key] = json.loads(data[key])
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode JSON for user {user_id}, key '{key}'. Data: {data[key]}")
+                        data[key] = {} if key == "replacement_words" else []
+                else: # Ensure default empty dict/list if value is None or missing
+                    data[key] = {} if key == "replacement_words" else [] 
             return data
         return None
 
-    # Anda mungkin perlu menambahkan metode lain seperti find() jika digunakan
-    # async def find(self, filter_query={}):
-    #     # Implementasi find untuk banyak user jika diperlukan
-    #     pass
+    async def delete_one(self, filter_query):
+        user_id = filter_query.get("user_id")
+        if not user_id:
+            raise ValueError("user_id is required for delete_one in users collection.")
+        await self.db_manager._execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
 
 class PremiumUsersCollection:
@@ -230,8 +227,16 @@ class PremiumUsersCollection:
 
         set_fields = update_query.get("$set", {})
         
-        set_clauses = [f"{k} = ?" for k in set_fields]
-        set_values = list(set_fields.values())
+        # Convert datetime objects to string for storage
+        prepared_set_fields = {}
+        for k, v in set_fields.items():
+            if isinstance(v, datetime):
+                prepared_set_fields[k] = v.isoformat() # ISO format for datetime strings
+            else:
+                prepared_set_fields[k] = v
+
+        set_clauses = [f"{k} = ?" for k in prepared_set_fields]
+        set_values = list(prepared_set_fields.values())
 
         existing_user = await self.db_manager._fetchone("SELECT 1 FROM premium_users WHERE user_id = ?", (user_id,))
         
@@ -247,7 +252,7 @@ class PremiumUsersCollection:
             placeholders.append("?")
             insert_values.append(user_id)
 
-            for k, v in set_fields.items():
+            for k, v in prepared_set_fields.items():
                 columns.append(k)
                 placeholders.append("?")
                 insert_values.append(v)
@@ -264,18 +269,31 @@ class PremiumUsersCollection:
         
         row = await self.db_manager._fetchone("SELECT * FROM premium_users WHERE user_id = ?", (user_id,))
         if row:
-            return dict(row)
+            data = dict(row)
+            # Convert datetime strings back to datetime objects
+            for dt_field in ['subscription_start', 'subscription_end', 'expireAt']:
+                if dt_field in data and data[dt_field] is not None:
+                    try:
+                        data[dt_field] = datetime.fromisoformat(data[dt_field])
+                    except ValueError:
+                        logger.warning(f"Failed to parse datetime for user {user_id}, field '{dt_field}'. Value: {data[dt_field]}")
+            return data
         return None
 
+    async def delete_one(self, filter_query):
+        user_id = filter_query.get("user_id")
+        if not user_id:
+            raise ValueError("user_id is required for delete_one in premium_users collection.")
+        await self.db_manager._execute("DELETE FROM premium_users WHERE user_id = ?", (user_id,))
+
     async def create_index(self, field_name, expireAfterSeconds=None):
-        # SQLite tidak memiliki fungsi TTL index seperti MongoDB.
-        # Fungsi ini hanya akan dicatat, dan Anda harus menangani penghapusan entri kadaluarsa secara manual
-        # atau menggunakan mekanisme lain (misalnya, cron job yang memanggil fungsi _cleanup_expired_premium_users).
+        # SQLite does not have TTL index functionality like MongoDB.
+        # This function will only log a warning. You must handle expiration cleanup manually.
         logger.info(f"SQLite does not support TTL indexes like MongoDB. "
                     f"Index creation for '{field_name}' with expireAfterSeconds={expireAfterSeconds} "
                     f"will not automatically delete expired records. "
                     f"You need to implement a separate cleanup mechanism for premium_users based on subscription_end.")
-        pass # Tidak ada yang perlu dilakukan untuk TTL index di SQLite secara langsung
+        pass # No direct action for TTL index in SQLite
 
 
 class StatisticsCollection:
@@ -283,10 +301,14 @@ class StatisticsCollection:
         self.db_manager = db_manager
 
     async def insert_one(self, document):
-        # Asumsi document memiliki event_type, timestamp, user_id
+        # Ensure timestamp is stored as a string
+        timestamp_str = document.get('timestamp')
+        if isinstance(timestamp_str, datetime):
+            timestamp_str = timestamp_str.isoformat()
+
         await self.db_manager._execute(
             "INSERT INTO statistics (event_type, timestamp, user_id) VALUES (?, ?, ?)",
-            (document.get('event_type'), document.get('timestamp'), document.get('user_id'))
+            (document.get('event_type'), timestamp_str, document.get('user_id'))
         )
     
     async def count_documents(self, filter_query={}):
@@ -324,7 +346,6 @@ class StatisticsCollection:
         
         order_by_sql = ""
         if sort_query:
-            # Contoh: sort_query = [("timestamp", -1)] untuk DESC, [("timestamp", 1)] untuk ASC
             sort_parts = []
             for field, order in sort_query:
                 direction = "DESC" if order == -1 else "ASC"
@@ -354,11 +375,15 @@ class RedeemCodeCollection:
         return None
 
     async def insert_one(self, document):
-        # Asumsi document memiliki code, duration_value, duration_unit, used_by, used_at
+        # Ensure used_at is stored as a string
+        used_at_str = document.get('used_at')
+        if isinstance(used_at_str, datetime):
+            used_at_str = used_at_str.isoformat()
+
         await self.db_manager._execute(
             "INSERT INTO redeem_code (code, duration_value, duration_unit, used_by, used_at) VALUES (?, ?, ?, ?, ?)",
             (document.get('code'), document.get('duration_value'), document.get('duration_unit'), 
-             document.get('used_by'), document.get('used_at'))
+             document.get('used_by'), used_at_str)
         )
     
     async def update_one(self, filter_query, update_query):
@@ -368,8 +393,16 @@ class RedeemCodeCollection:
 
         set_fields = update_query.get("$set", {})
         
-        set_clauses = [f"{k} = ?" for k in set_fields]
-        set_values = list(set_fields.values())
+        # Convert datetime to string if present
+        prepared_set_fields = {}
+        for k, v in set_fields.items():
+            if isinstance(v, datetime):
+                prepared_set_fields[k] = v.isoformat()
+            else:
+                prepared_set_fields[k] = v
+
+        set_clauses = [f"{k} = ?" for k in prepared_set_fields]
+        set_values = list(prepared_set_fields.values())
 
         query = f"UPDATE redeem_code SET {', '.join(set_clauses)} WHERE code = ?"
         await self.db_manager._execute(query, set_values + [code])
@@ -380,38 +413,20 @@ class RedeemCodeCollection:
             raise ValueError("code is required for delete_one in redeem_code collection.")
         await self.db_manager._execute("DELETE FROM redeem_code WHERE code = ?", (code,))
 
-
-# --- Inisialisasi 'collections' global seperti sebelumnya, tapi sekarang dari db_manager ---
-# Ini memastikan bahwa bagian lain dari kode Anda yang memanggil users_collection.update_one, dll.,
-# tidak perlu diubah secara drastis di luar fungsi-fungsi ini.
 users_collection = None
 premium_users_collection = None
 statistics_collection = None
 codedb = None
 
 async def init_db_collections():
-    """Menginisialisasi objek koleksi setelah koneksi database siap."""
+    """Initializes collection objects after database connection is ready."""
     global users_collection, premium_users_collection, statistics_collection, codedb
-    await db_manager.connect() # Pastikan koneksi dan tabel dibuat
+    await db_manager.connect() # Ensure connection and tables are created
     users_collection = await db_manager.get_users_collection()
     premium_users_collection = await db_manager.get_premium_users_collection()
     statistics_collection = await db_manager.get_statistics_collection()
     codedb = await db_manager.get_codedb_collection()
     logger.info("Database collections initialized for aiosqlite.")
-
-# Panggil fungsi ini di awal aplikasi Anda (misalnya di main.py atau app.py)
-# Contoh: asyncio.run(init_db_collections())
-
-# Hapus baris yang menggunakan motor
-# mongo_client = AsyncIOMotorClient(MONGO_URI)
-# db = mongo_client[DB_NAME]
-# users_collection = db["users"]
-# premium_users_collection = db["premium_users"]
-# statistics_collection = db["statistics"]
-# codedb = db["redeem_code"]
-
-# Tambahkan import yang diperlukan untuk JSON (untuk serialisasi/deserialisasi data)
-import json
 
 # ------- < start > Session Encoder don't change -------
 
@@ -422,7 +437,7 @@ a4 = "cmVwbHlfcGhvdG8="
 a5 = "c3RhcnQ="
 attr1 = "cGhvdG8="
 attr2 = "ZmlsZV9pZA=="
-a7 = "SGkg8J+RiyBXZWxjb21lLCBXYW5uYSBpbnRyby4uLj8gCgrinLPvuI8gSSBjYW4gc2F2ZSBwb3N0cyBmcm9tIGNoYW5uZWxzIG9yIGdyb3VwcyB3aGVyZSBmb3J3YXJkaW5nIGlzIG9mZi4gSSBjYW4gZG93bmxvYWQgdmlkZW9zL2F1ZGlvIGZyb20gWVQsIElOU1RBLCAuLi4gc29jaWFsIHBsYXRmb3JtcwrinLPvuI8gU2ltcGx5IHNlbmQgdGhlIHBvc3QgbGluayBvZiBhIHB1YmxpYyBjaGFubmVsLiBGb3IgcHJpdmF0ZSBjaGFubmVscywgZG8gL2xvZ2luLiBTZW5kIC9oZWxwIHRvIGtub3cgbW9yZS4="
+a7 = "SGkg8J+RiyBXZWxjb21lLCBXYW5uYSBpbnRyby4uLj8gQgrinLPvuI8gSSBjYW4gc2F2ZSBwb3N0cyBmcm9tIGNoYW5uZWxzIG9yIGdyb3VwcyB3aGVyZSBmb3J3YXJkaW5nIGlzIG9mZi4gSSBjYW4gZG93bmxvYWQgdmlkZW9zL2F1ZGlvIGZyb20gWVQsIElOU1RBLCAuLi4gc29jaWFsIHBsYXRmb3JtcwrinLPvuI8gU2ltcGx5IHNlbmQgdGhlIHBvc3QgbGluayBvZiBhIHB1YmxpYyBjaGFubmVsLiBGb3IgcHJpdmF0ZSBjaGFubmVscywgZG8gL2xvZ2luLiBTZW5kIC9oZWxwIHRvIGtub3cgbW9yZS4="
 a8 = "Sm9pbiBDaGFubmVs"
 a9 = "R2V0IFByZW1pdW0="
 a10 = "aHR0cHM6Ly90Lm1lL3RlYW1fc3B5X3Bybw=="
@@ -435,7 +450,9 @@ def is_private_link(link):
 
 
 def thumbnail(sender):
-    return f'{sender}.jpg' if os.path.exists(f'{sender}.jpg') else None
+    # Adjust path if thumbnails are stored in data/thumbnails
+    thumb_path = f'./data/thumbnails/{sender}.jpg' 
+    return thumb_path if os.path.exists(thumb_path) else None
 
 
 def hhmmss(seconds):
@@ -488,7 +505,7 @@ async def is_private_chat(event):
 
 
 async def save_user_data(user_id, key, value):
-    # Menggunakan objek `users_collection` yang sudah diinisialisasi
+    # The UsersCollection.update_one will handle JSON serialization.
     await users_collection.update_one(
         {"user_id": user_id},
         {"$set": {key: value}},
@@ -516,7 +533,7 @@ async def save_user_session(user_id, session_string):
             {"user_id": user_id},
             {"$set": {
                 "session_string": session_string,
-                "updated_at": datetime.now()
+                "updated_at": datetime.now().isoformat() # Store as ISO format string
             }},
             upsert=True
         )
@@ -531,7 +548,7 @@ async def remove_user_session(user_id):
     try:
         await users_collection.update_one(
             {"user_id": user_id},
-            {"$unset": {"session_string": ""}} # $unset akan diubah menjadi set ke NULL di SQLite
+            {"$unset": {"session_string": ""}} # $unset will set to NULL in SQLite
         )
         logger.info(f"Removed session for user {user_id}")
         return True
@@ -546,7 +563,7 @@ async def save_user_bot(user_id, bot_token):
             {"user_id": user_id},
             {"$set": {
                 "bot_token": bot_token,
-                "updated_at": datetime.now()
+                "updated_at": datetime.now().isoformat() # Store as ISO format string
             }},
             upsert=True
         )
@@ -561,7 +578,7 @@ async def remove_user_bot(user_id):
     try:
         await users_collection.update_one(
             {"user_id": user_id},
-            {"$unset": {"bot_token": ""}} # $unset akan diubah menjadi set ke NULL di SQLite
+            {"$unset": {"bot_token": ""}} # $unset will set to NULL in SQLite
         )
         logger.info(f"Removed bot token for user {user_id}")
         return True
@@ -575,32 +592,38 @@ async def process_text_with_rules(user_id, text):
         return ""
 
     try:
-        # Menggunakan get_user_data_key yang sudah diperbarui
         replacements = await get_user_data_key(user_id, "replacement_words", {})
         delete_words = await get_user_data_key(user_id, "delete_words", [])
 
         processed_text = text
         for word, replacement in replacements.items():
+            # Use re.escape to handle special characters in 'word' if needed for re.sub
+            # For simple replace, string.replace() is fine.
             processed_text = processed_text.replace(word, replacement)
 
         if delete_words:
-            words = processed_text.split()
-            filtered_words = [w for w in words if w not in delete_words]
+            # Re-implement filtering words by exact match for delete_words
+            words_in_text = processed_text.split()
+            filtered_words = [w for w in words_in_text if w not in delete_words]
             processed_text = " ".join(filtered_words)
 
         return processed_text
     except Exception as e:
-        logger.error(f"Error processing text with rules: {e}")
+        logger.error(f"Error processing text with rules for user {user_id}: {e}")
         return text
 
 
 async def screenshot(video: str, duration: int, sender: str) -> str | None:
-    existing_screenshot = f"{sender}.jpg"
+    # Ensure the directory exists for thumbnails
+    thumbnail_dir = './data/thumbnails'
+    os.makedirs(thumbnail_dir, exist_ok=True)
+
+    existing_screenshot = os.path.join(thumbnail_dir, f"{sender}.jpg")
     if os.path.exists(existing_screenshot):
         return existing_screenshot
 
     time_stamp = hhmmss(duration // 2)
-    output_file = datetime.now().isoformat("_", "seconds") + ".jpg"
+    output_file = os.path.join(thumbnail_dir, f"{datetime.now().isoformat('_', 'seconds')}_{sender}.jpg")
 
     cmd = [
         "ffmpeg",
@@ -622,7 +645,7 @@ async def screenshot(video: str, duration: int, sender: str) -> str | None:
     if os.path.isfile(output_file):
         return output_file
     else:
-        print(f"FFmpeg Error: {stderr.decode().strip()}")
+        logger.error(f"FFmpeg Error for screenshot: {stderr.decode().strip()}")
         return None
 
 
@@ -634,26 +657,27 @@ async def get_video_metadata(file_path):
     try:
         def _extract_metadata():
             try:
-                vcap = cv2.VideoCapture(file_path)
-                if not vcap.isOpened():
-                    return default_values
-
-                width = round(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = round(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                fps = vcap.get(cv2.CAP_PROP_FPS)
-                frame_count = vcap.get(cv2.CAP_PROP_FRAME_COUNT)
-
-                if fps <= 0:
-                    return default_values
-
-                duration = round(frame_count / fps)
-                if duration <= 0:
-                    return default_values
-
-                vcap.release()
-                return {'width': width, 'height': height, 'duration': duration}
+                # Use ffprobe instead of cv2 for better reliability and less overhead
+                # Install ffprobe if not already available (usually comes with ffmpeg)
+                import subprocess
+                cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                       "-show_entries", "stream=width,height,duration", "-of", "json", file_path]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                metadata = json.loads(result.stdout)
+                
+                if "streams" in metadata and len(metadata["streams"]) > 0:
+                    stream = metadata["streams"][0]
+                    width = int(stream.get("width", default_values['width']))
+                    height = int(stream.get("height", default_values['height']))
+                    duration = float(stream.get("duration", default_values['duration']))
+                    return {'width': width, 'height': height, 'duration': int(duration)} # Duration as int
+                return default_values
+            except FileNotFoundError:
+                logger.error("ffprobe not found. Please ensure ffmpeg/ffprobe is installed and in your PATH.")
+                return default_values
             except Exception as e:
-                logger.error(f"Error in video_metadata: {e}")
+                logger.error(f"Error in _extract_metadata with ffprobe: {e}")
                 return default_values
 
         return await loop.run_in_executor(executor, _extract_metadata)
@@ -666,39 +690,35 @@ async def get_video_metadata(file_path):
 async def add_premium_user(user_id, duration_value, duration_unit):
     try:
         now = datetime.now()
-        expiry_date = None
+        expiry_date = now
 
         if duration_unit == "min":
-            expiry_date = now + timedelta(minutes=duration_value)
+            expiry_date += timedelta(minutes=duration_value)
         elif duration_unit == "hours":
-            expiry_date = now + timedelta(hours=duration_value)
+            expiry_date += timedelta(hours=duration_value)
         elif duration_unit == "days":
-            expiry_date = now + timedelta(days=duration_value)
+            expiry_date += timedelta(days=duration_value)
         elif duration_unit == "weeks":
-            expiry_date = now + timedelta(weeks=duration_value)
+            expiry_date += timedelta(weeks=duration_value)
         elif duration_unit == "month":
-            expiry_date = now + timedelta(days=30 * duration_value)
+            expiry_date += timedelta(days=30 * duration_value) # Approximation for month
         elif duration_unit == "year":
-            expiry_date = now + timedelta(days=365 * duration_value)
+            expiry_date += timedelta(days=365 * duration_value) # Approximation for year
         elif duration_unit == "decades":
-            expiry_date = now + timedelta(days=3650 * duration_value)
+            expiry_date += timedelta(days=3650 * duration_value)
         else:
             return False, "Invalid duration unit"
 
         await premium_users_collection.update_one(
             {"user_id": user_id},
             {"$set": {
-                "user_id": user_id,
+                "user_id": user_id, # Ensure user_id is in $set for upsert
                 "subscription_start": now,
                 "subscription_end": expiry_date,
-                # "expireAt": expiry_date # expireAt tidak relevan lagi untuk TTL di SQLite
+                "expireAt": expiry_date # Keep for compatibility
             }},
             upsert=True
         )
-
-        # Tidak perlu create_index dengan expireAfterSeconds di SQLite
-        # await premium_users_collection.create_index("expireAt", expireAfterSeconds=0)
-
         return True, expiry_date
     except Exception as e:
         logger.error(f"Error adding premium user {user_id}: {e}")
@@ -709,14 +729,9 @@ async def is_premium_user(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
         if user and "subscription_end" in user:
-            # Pastikan subscription_end adalah objek datetime
-            if isinstance(user["subscription_end"], str):
-                subscription_end = datetime.strptime(user["subscription_end"], '%Y-%m-%d %H:%M:%S.%f')
-            else:
-                subscription_end = user["subscription_end"]
-                
+            # find_one now ensures subscription_end is datetime object
             now = datetime.now()
-            return now < subscription_end
+            return now < user["subscription_end"]
         return False
     except Exception as e:
         logger.error(f"Error checking premium status for {user_id}: {e}")
@@ -726,14 +741,8 @@ async def is_premium_user(user_id):
 async def get_premium_details(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
-        if user and "subscription_end" in user:
-            # Konversi string datetime ke objek datetime jika diperlukan
-            if isinstance(user["subscription_end"], str):
-                user["subscription_end"] = datetime.strptime(user["subscription_end"], '%Y-%m-%d %H:%M:%S.%f')
-            if isinstance(user["subscription_start"], str):
-                user["subscription_start"] = datetime.strptime(user["subscription_start"], '%Y-%m-%d %H:%M:%S.%f')
-            return user
-        return None
+        # find_one now ensures datetime objects are returned
+        return user
     except Exception as e:
         logger.error(f"Error getting premium details for {user_id}: {e}")
         return None
