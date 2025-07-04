@@ -5,8 +5,9 @@ import re
 import cv2
 import logging
 import asyncio
-import aiosqlite # Import aiosqlite
+import aiosqlite
 from datetime import datetime, timedelta
+import json # <--- ADD THIS IMPORT for json.dumps and json.loads
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,58 +16,54 @@ PUBLIC_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/([^/]+)(/(\d
 PRIVATE_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/c/(\d+)(/(\d+))?')
 VIDEO_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mpeg", "mpg", "3gp"}
 
-DB_PATH = 'data.db' # Ganti dengan path yang Anda inginkan, bisa dari config.py
+DB_PATH = 'data.db'
 
 class DatabaseManager:
     def __init__(self, db_path):
         self.db_path = db_path
-        self._conn = None # Untuk menyimpan koneksi database
+        self._conn = None
 
     async def connect(self):
-        """Membuat koneksi ke database jika belum ada."""
         if self._conn is None:
             self._conn = await aiosqlite.connect(self.db_path)
-            self._conn.row_factory = aiosqlite.Row # Mengatur row_factory agar hasil query bisa diakses seperti dict
+            self._conn.row_factory = aiosqlite.Row
 
-            # Inisialisasi tabel jika belum ada
             await self._create_tables()
 
     async def close(self):
-        """Menutup koneksi database."""
         if self._conn:
             await self._conn.close()
             self._conn = None
 
     async def _execute(self, query, params=()):
-        """Mengeksekusi query database dan mengembalikan cursor."""
-        await self.connect() # Pastikan koneksi terbuka
+        await self.connect()
         try:
             cursor = await self._conn.execute(query, params)
             await self._conn.commit()
             return cursor
         except Exception as e:
             logger.error(f"Error executing query: {query} with params {params} - {e}")
-            raise # Re-raise exception untuk penanganan lebih lanjut
+            raise
 
     async def _fetchone(self, query, params=()):
-        """Mengeksekusi query dan mengembalikan satu baris."""
         cursor = await self._execute(query, params)
         return await cursor.fetchone()
 
     async def _fetchall(self, query, params=()):
-        """Mengeksekusi query dan mengembalikan semua baris."""
         cursor = await self._execute(query, params)
         return await cursor.fetchall()
 
     async def _create_tables(self):
-        """Membuat tabel yang diperlukan jika belum ada."""
         await self._execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 session_string TEXT,
                 bot_token TEXT,
-                replacement_words TEXT, -- Simpan sebagai JSON string
-                delete_words TEXT,      -- Simpan sebagai JSON string
+                replacement_words TEXT,
+                delete_words TEXT,
+                chat_id TEXT,  -- <--- ADD THIS LINE
+                caption TEXT,  -- <--- ADD THIS LINE
+                rename_tag TEXT, -- <--- ADD THIS LINE
                 updated_at DATETIME
             )
         ''')
@@ -77,9 +74,6 @@ class DatabaseManager:
                 subscription_end DATETIME
             )
         ''')
-        # SQLite tidak memiliki fitur TTL (Time-To-Live) index seperti MongoDB.
-        # Anda perlu membersihkan user premium kadaluarsa secara manual atau dengan cron job terpisah.
-        # Kolom expireAt di MongoDB adalah untuk TTL, di SQLite kita akan pakai subscription_end
         
         await self._execute('''
             CREATE TABLE IF NOT EXISTS statistics (
@@ -87,7 +81,6 @@ class DatabaseManager:
                 event_type TEXT,
                 timestamp DATETIME,
                 user_id INTEGER
-                -- Tambahkan kolom statistik lainnya sesuai kebutuhan Anda
             )
         ''')
         await self._execute('''
@@ -101,7 +94,6 @@ class DatabaseManager:
         ''')
         logger.info("Database tables initialized.")
 
-    # Metode untuk mengakses 'collections'
     async def get_users_collection(self):
         return UsersCollection(self)
 
@@ -114,10 +106,8 @@ class DatabaseManager:
     async def get_codedb_collection(self):
         return RedeemCodeCollection(self)
 
-# Inisialisasi DatabaseManager global
 db_manager = DatabaseManager(DB_PATH)
 
-# Kelas-kelas pembantu untuk 'collections' agar panggilan tetap mirip
 class UsersCollection:
     def __init__(self, db_manager):
         self.db_manager = db_manager
@@ -130,17 +120,20 @@ class UsersCollection:
         set_fields = update_query.get("$set", {})
         unset_fields = update_query.get("$unset", {})
         
-        # Konversi dict/list ke JSON string untuk penyimpanan
+        # Convert dict/list to JSON string for storage
         if "replacement_words" in set_fields and isinstance(set_fields["replacement_words"], dict):
             set_fields["replacement_words"] = json.dumps(set_fields["replacement_words"])
         if "delete_words" in set_fields and isinstance(set_fields["delete_words"], list):
             set_fields["delete_words"] = json.dumps(set_fields["delete_words"])
 
-        # Bangun SET clause
+        # Add updated_at for all updates
+        set_fields["updated_at"] = datetime.now().isoformat()
+
+        # Build SET clause
         set_clauses = [f"{k} = ?" for k in set_fields]
         set_values = list(set_fields.values())
 
-        # Bangun UNSET (set to NULL) clause
+        # Build UNSET (set to NULL) clause
         unset_clauses = [f"{k} = NULL" for k in unset_fields]
 
         if set_clauses or unset_clauses:
@@ -151,37 +144,33 @@ class UsersCollection:
                 update_parts.append(", ".join(unset_clauses))
             
             update_sql = "SET " + ", ".join(update_parts)
-            values = set_values + [user_id]
             
-            # Cek apakah user_id sudah ada
             existing_user = await self.db_manager._fetchone("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
             
             if existing_user:
                 query = f"UPDATE users {update_sql} WHERE user_id = ?"
+                values = set_values + [user_id]
                 await self.db_manager._execute(query, values)
             elif upsert:
-                # Untuk upsert, kita harus membangun INSERT atau UPDATE secara manual
-                # Ambil semua kolom yang mungkin di set atau di unset (untuk NULL)
-                columns = []
-                placeholders = []
-                insert_values = []
-                
-                # Tambahkan user_id
-                columns.append("user_id")
-                placeholders.append("?")
-                insert_values.append(user_id)
+                # For upsert, we need to construct an INSERT statement
+                columns_to_insert = ["user_id"]
+                placeholders_to_insert = ["?"]
+                values_to_insert = [user_id]
 
                 for k, v in set_fields.items():
-                    columns.append(k)
-                    placeholders.append("?")
-                    insert_values.append(v)
+                    columns_to_insert.append(k)
+                    placeholders_to_insert.append("?")
+                    values_to_insert.append(v)
                 
-                for k in unset_fields:
-                    columns.append(k)
-                    placeholders.append("NULL") # Set to NULL for unset
+                # For unset fields in an upsert, they should either be explicitly added as NULL
+                # or assumed to be NULL by default in new rows if not set.
+                # Since we are using INSERT OR REPLACE, any existing unset fields would be preserved as NULL
+                # if not explicitly included in the SET part of the upsert.
+                # If you need to ensure they are NULL on initial insert, you'd add them here.
+                # For simplicity, we'll assume new records get default NULL for missing fields.
 
-                insert_sql = f"INSERT OR REPLACE INTO users ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-                await self.db_manager._execute(insert_sql, insert_values)
+                insert_sql = f"INSERT OR REPLACE INTO users ({', '.join(columns_to_insert)}) VALUES ({', '.join(placeholders_to_insert)})"
+                await self.db_manager._execute(insert_sql, values_to_insert)
             else:
                 logger.warning(f"User {user_id} not found and upsert is false.")
         else:
@@ -195,22 +184,17 @@ class UsersCollection:
         row = await self.db_manager._fetchone("SELECT * FROM users WHERE user_id = ?", (user_id,))
         if row:
             data = dict(row)
-            # Konversi JSON string kembali ke dict/list
+            # Convert JSON string back to dict/list
             if 'replacement_words' in data and data['replacement_words']:
                 data['replacement_words'] = json.loads(data['replacement_words'])
             else:
-                data['replacement_words'] = {} # Pastikan defaultnya dict
+                data['replacement_words'] = {}
             if 'delete_words' in data and data['delete_words']:
                 data['delete_words'] = json.loads(data['delete_words'])
             else:
-                data['delete_words'] = [] # Pastikan defaultnya list
+                data['delete_words'] = []
             return data
         return None
-
-    # Anda mungkin perlu menambahkan metode lain seperti find() jika digunakan
-    # async def find(self, filter_query={}):
-    #     # Implementasi find untuk banyak user jika diperlukan
-    #     pass
 
 
 class PremiumUsersCollection:
@@ -262,14 +246,11 @@ class PremiumUsersCollection:
         return None
 
     async def create_index(self, field_name, expireAfterSeconds=None):
-        # SQLite tidak memiliki fungsi TTL index seperti MongoDB.
-        # Fungsi ini hanya akan dicatat, dan Anda harus menangani penghapusan entri kadaluarsa secara manual
-        # atau menggunakan mekanisme lain (misalnya, cron job yang memanggil fungsi _cleanup_expired_premium_users).
         logger.info(f"SQLite does not support TTL indexes like MongoDB. "
                     f"Index creation for '{field_name}' with expireAfterSeconds={expireAfterSeconds} "
                     f"will not automatically delete expired records. "
                     f"You need to implement a separate cleanup mechanism for premium_users based on subscription_end.")
-        pass # Tidak ada yang perlu dilakukan untuk TTL index di SQLite secara langsung
+        pass
 
 
 class StatisticsCollection:
@@ -277,7 +258,6 @@ class StatisticsCollection:
         self.db_manager = db_manager
 
     async def insert_one(self, document):
-        # Asumsi document memiliki event_type, timestamp, user_id
         await self.db_manager._execute(
             "INSERT INTO statistics (event_type, timestamp, user_id) VALUES (?, ?, ?)",
             (document.get('event_type'), document.get('timestamp'), document.get('user_id'))
@@ -318,7 +298,6 @@ class StatisticsCollection:
         
         order_by_sql = ""
         if sort_query:
-            # Contoh: sort_query = [("timestamp", -1)] untuk DESC, [("timestamp", 1)] untuk ASC
             sort_parts = []
             for field, order in sort_query:
                 direction = "DESC" if order == -1 else "ASC"
@@ -348,7 +327,6 @@ class RedeemCodeCollection:
         return None
 
     async def insert_one(self, document):
-        # Asumsi document memiliki code, duration_value, duration_unit, used_by, used_at
         await self.db_manager._execute(
             "INSERT INTO redeem_code (code, duration_value, duration_unit, used_by, used_at) VALUES (?, ?, ?, ?, ?)",
             (document.get('code'), document.get('duration_value'), document.get('duration_unit'), 
@@ -380,16 +358,13 @@ statistics_collection = None
 codedb = None
 
 async def init_db_collections():
-    """Menginisialisasi objek koleksi setelah koneksi database siap."""
     global users_collection, premium_users_collection, statistics_collection, codedb
-    await db_manager.connect() # Pastikan koneksi dan tabel dibuat
+    await db_manager.connect()
     users_collection = await db_manager.get_users_collection()
     premium_users_collection = await db_manager.get_premium_users_collection()
     statistics_collection = await db_manager.get_statistics_collection()
     codedb = await db_manager.get_codedb_collection()
     logger.info("Database collections initialized for aiosqlite.")
-
-import json
 
 # ------- < start > Session Encoder don't change -------
 
@@ -466,7 +441,6 @@ async def is_private_chat(event):
 
 
 async def save_user_data(user_id, key, value):
-    # Menggunakan objek `users_collection` yang sudah diinisialisasi
     await users_collection.update_one(
         {"user_id": user_id},
         {"$set": {key: value}},
@@ -494,7 +468,7 @@ async def save_user_session(user_id, session_string):
             {"user_id": user_id},
             {"$set": {
                 "session_string": session_string,
-                "updated_at": datetime.now()
+                "updated_at": datetime.now().isoformat()
             }},
             upsert=True
         )
@@ -509,7 +483,7 @@ async def remove_user_session(user_id):
     try:
         await users_collection.update_one(
             {"user_id": user_id},
-            {"$unset": {"session_string": ""}} # $unset akan diubah menjadi set ke NULL di SQLite
+            {"$unset": {"session_string": ""}}
         )
         logger.info(f"Removed session for user {user_id}")
         return True
@@ -524,7 +498,7 @@ async def save_user_bot(user_id, bot_token):
             {"user_id": user_id},
             {"$set": {
                 "bot_token": bot_token,
-                "updated_at": datetime.now()
+                "updated_at": datetime.now().isoformat()
             }},
             upsert=True
         )
@@ -539,7 +513,7 @@ async def remove_user_bot(user_id):
     try:
         await users_collection.update_one(
             {"user_id": user_id},
-            {"$unset": {"bot_token": ""}} # $unset akan diubah menjadi set ke NULL di SQLite
+            {"$unset": {"bot_token": ""}}
         )
         logger.info(f"Removed bot token for user {user_id}")
         return True
@@ -553,7 +527,6 @@ async def process_text_with_rules(user_id, text):
         return ""
 
     try:
-        # Menggunakan get_user_data_key yang sudah diperbarui
         replacements = await get_user_data_key(user_id, "replacement_words", {})
         delete_words = await get_user_data_key(user_id, "delete_words", [])
 
@@ -667,15 +640,11 @@ async def add_premium_user(user_id, duration_value, duration_unit):
             {"user_id": user_id},
             {"$set": {
                 "user_id": user_id,
-                "subscription_start": now,
-                "subscription_end": expiry_date,
-                # "expireAt": expiry_date # expireAt tidak relevan lagi untuk TTL di SQLite
+                "subscription_start": now.isoformat(), # Store as ISO format string
+                "subscription_end": expiry_date.isoformat(), # Store as ISO format string
             }},
             upsert=True
         )
-
-        # Tidak perlu create_index dengan expireAfterSeconds di SQLite
-        # await premium_users_collection.create_index("expireAt", expireAfterSeconds=0)
 
         return True, expiry_date
     except Exception as e:
@@ -687,9 +656,9 @@ async def is_premium_user(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
         if user and "subscription_end" in user:
-            # Pastikan subscription_end adalah objek datetime
+            # Convert string datetime to datetime object
             if isinstance(user["subscription_end"], str):
-                subscription_end = datetime.strptime(user["subscription_end"], '%Y-%m-%d %H:%M:%S.%f')
+                subscription_end = datetime.fromisoformat(user["subscription_end"])
             else:
                 subscription_end = user["subscription_end"]
                 
@@ -705,11 +674,11 @@ async def get_premium_details(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
         if user and "subscription_end" in user:
-            # Konversi string datetime ke objek datetime jika diperlukan
+            # Convert string datetime to datetime object
             if isinstance(user["subscription_end"], str):
-                user["subscription_end"] = datetime.strptime(user["subscription_end"], '%Y-%m-%d %H:%M:%S.%f')
+                user["subscription_end"] = datetime.fromisoformat(user["subscription_end"])
             if isinstance(user["subscription_start"], str):
-                user["subscription_start"] = datetime.strptime(user["subscription_start"], '%Y-%m-%d %H:%M:%S.%f')
+                user["subscription_start"] = datetime.fromisoformat(user["subscription_start"])
             return user
         return None
     except Exception as e:
