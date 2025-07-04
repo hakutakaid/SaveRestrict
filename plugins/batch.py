@@ -1,7 +1,4 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
-
+#plugins/batchch.py
 import os, re, time, asyncio, json, asyncio 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -201,15 +198,19 @@ async def send_direct(c, m, tcid, ft=None, rtmid=None):
 async def process_msg(c, u, m, d, lt, uid, i):
     try:
         cfg_chat = await get_user_data_key(d, 'chat_id', None)
-        tcid = d
+        tcid = d # Default target chat ID is the user's chat ID
         rtmid = None
         if cfg_chat:
-            if '/' in cfg_chat:
-                parts = cfg_chat.split('/', 1)
-                tcid = int(parts[0])
-                rtmid = int(parts[1]) if len(parts) > 1 else None
-            else:
-                tcid = int(cfg_chat)
+            try:
+                if '/' in cfg_chat:
+                    parts = cfg_chat.split('/', 1)
+                    tcid = int(parts[0])
+                    rtmid = int(parts[1]) if len(parts) > 1 else None
+                else:
+                    tcid = int(cfg_chat)
+            except ValueError:
+                print(f"Invalid chat_id format '{cfg_chat}', falling back to user chat_id.")
+                tcid = d # Fallback to user's chat if cfg_chat is invalid
         
         if m.media:
             orig_text = m.caption.markdown if m.caption else ''
@@ -217,92 +218,130 @@ async def process_msg(c, u, m, d, lt, uid, i):
             user_cap = await get_user_data_key(d, 'caption', '')
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
             
+            # Direct send for public links (no download needed if not self-hosted)
             if lt == 'public' and not emp.get(i, False):
-                await send_direct(c, m, tcid, ft, rtmid)
-                return 'Sent directly.'
+                # Ensure 'm' itself is not None and has the necessary media
+                if await send_direct(c, m, tcid, ft, rtmid):
+                    return 'Sent directly.'
+                else:
+                    # If direct send failed, we might still want to try download as fallback
+                    print("Direct send failed, attempting download as fallback.")
             
             st = time.time()
-            p = await c.send_message(d, 'Downloading...')
+            p = await c.send_message(d, 'Downloading...') # 'p' is the progress message
 
-            c_name = f"{time.time()}"
+            # Determine file_name for download, ensure it's always set
+            file_name_base = f"{time.time()}"
+            ext = ""
             if m.video:
-                file_name = m.video.file_name
-                if not file_name:
-                    file_name = f"{time.time()}.mp4"
-                    c_name = sanitize(file_name)
+                ext = ".mp4"
+                if m.video.file_name:
+                    file_name_base = os.path.splitext(m.video.file_name)[0]
             elif m.audio:
-                file_name = m.audio.file_name
-                if not file_name:
-                    file_name = f"{time.time()}.mp3"
-                    c_name = sanitize(file_name)
+                ext = ".mp3"
+                if m.audio.file_name:
+                    file_name_base = os.path.splitext(m.audio.file_name)[0]
             elif m.document:
-                file_name = m.document.file_name
-                if not file_name:
-                    file_name = f"{time.time()}"
-                    c_name = sanitize(file_name)
+                ext = os.path.splitext(m.document.file_name)[1] if m.document.file_name else ""
+                if m.document.file_name:
+                    file_name_base = os.path.splitext(m.document.file_name)[0]
             elif m.photo:
-                file_name = f"{time.time()}.jpg"
-                c_name = sanitize(file_name)
-    
+                ext = ".jpg"
+            
+            # Sanitize and ensure file_name is not empty
+            c_name = sanitize(file_name_base) + ext
+            if not c_name: # Fallback if sanitize makes it empty
+                c_name = f"downloaded_file_{int(time.time())}{ext or '.bin'}"
+
             f = await u.download_media(m, file_name=c_name, progress=prog, progress_args=(c, d, p.id, st))
             
-            if not f:
-                await c.edit_message_text(d, p.id, 'Failed.')
-                return 'Failed.'
+            if not f or not os.path.exists(f): # Crucial check if download failed
+                await c.edit_message_text(d, p.id, 'Failed to download file.')
+                return 'Failed to download.'
             
             await c.edit_message_text(d, p.id, 'Renaming...')
-            if (
-                (m.video and m.video.file_name) or
-                (m.audio and m.audio.file_name) or
-                (m.document and m.document.file_name)
-            ):
-                f = await rename_file(f, d, p)
-            
+            # Ensure 'f' is a string before passing to rename_file
+            if isinstance(f, str):
+                renamed_f = await rename_file(f, d, p)
+                if renamed_f and os.path.exists(renamed_f): # Check if rename was successful
+                    f = renamed_f
+                else:
+                    print(f"Renaming failed or returned invalid path for {f}. Continuing with original path.")
+                    # Keep original 'f' if rename failed. Log it if necessary.
+            else:
+                print(f"Downloaded file path is not a string: {f}. Skipping rename.")
+
             fsize = os.path.getsize(f) / (1024 * 1024 * 1024)
-            th = thumbnail(d)
-            
+            th = thumbnail(d) # This can return None, handle it later in send_media calls
+
+            # Handling large files (over 2GB) with userbot Y
             if fsize > 2 and Y:
                 st = time.time()
                 await c.edit_message_text(d, p.id, 'File is larger than 2GB. Using alternative method...')
-                await upd_dlg(Y)
-                mtd = await get_video_metadata(f)
-                dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                th = await screenshot(f, dur, d)
-                
-                send_funcs = {'video': Y.send_video, 'video_note': Y.send_video_note, 
-                            'voice': Y.send_voice, 'audio': Y.send_audio, 
-                            'photo': Y.send_photo, 'document': Y.send_document}
-                
-                for mtype, func in send_funcs.items():
-                    if f.endswith('.mp4'): mtype = 'video'
-                    if getattr(m, mtype, None):
-                        sent = await func(LOG_GROUP, f, thumb=th if mtype == 'video' else None, 
-                                        duration=dur if mtype == 'video' else None,
-                                        height=h if mtype == 'video' else None,
-                                        width=w if mtype == 'video' else None,
-                                        caption=ft if m.caption and mtype not in ['video_note', 'voice'] else None, 
-                                        reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
-                        break
-                else:
-                    sent = await Y.send_document(LOG_GROUP, f, thumb=th, caption=ft if m.caption else None,
+                try:
+                    await upd_dlg(Y) # Ensure userbot dialogs are updated
+                except Exception as e:
+                    print(f"Userbot dialog update failed: {e}. Large file upload might fail.")
+
+                dur, h, w = None, None, None
+                if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']): # Check for video extension
+                    mtd = await get_video_metadata(f)
+                    dur, h, w = mtd.get('duration'), mtd.get('height'), mtd.get('width')
+                    th = await screenshot(f, dur or 1, d) # Pass default duration if None
+
+                sent = None
+                try:
+                    # Generic way to send, try to match media type
+                    if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']):
+                        sent = await Y.send_video(LOG_GROUP, f, thumb=th, caption=ft,
+                                                duration=dur, height=h, width=w,
                                                 reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
-                
-                await c.copy_message(d, LOG_GROUP, sent.id)
-                os.remove(f)
-                await c.delete_messages(d, p.id)
-                
-                return 'Done (Large file).'
-            
+                    elif m.audio:
+                        sent = await Y.send_audio(LOG_GROUP, f, thumb=th, caption=ft,
+                                                duration=m.audio.duration, performer=m.audio.performer, title=m.audio.title,
+                                                reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
+                    elif m.photo:
+                        sent = await Y.send_photo(LOG_GROUP, f, caption=ft,
+                                                reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
+                    elif m.document:
+                        sent = await Y.send_document(LOG_GROUP, f, thumb=th, caption=ft,
+                                                    reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
+                    # Add more specific media types if needed (video_note, voice, sticker)
+                    else:
+                        # Fallback to document if type not explicitly handled
+                        sent = await Y.send_document(LOG_GROUP, f, thumb=th, caption=ft,
+                                                    reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
+
+                    if sent:
+                        await c.copy_message(d, LOG_GROUP, sent.id) # Copy to user's chat from log group
+                        # Ensure 'th' is removed only if it was created during screenshot
+                        if th and os.path.exists(th) and th != f'{d}.jpg': # Check if it's a temp screenshot and not user's custom thumb
+                            os.remove(th)
+                        os.remove(f)
+                        await c.delete_messages(d, p.id)
+                        return 'Done (Large file).'
+                    else:
+                        raise Exception("Failed to send large file via userbot.")
+
+                except Exception as upload_e:
+                    print(f"Large file upload failed for {f}: {upload_e}")
+                    await c.edit_message_text(d, p.id, f'Large file upload failed: {str(upload_e)[:50]}')
+                    if th and os.path.exists(th) and th != f'{d}.jpg':
+                        os.remove(th)
+                    if os.path.exists(f): os.remove(f)
+                    return 'Large file upload failed.'
+
+            # Handling smaller files or if userbot Y is not available
             await c.edit_message_text(d, p.id, 'Uploading...')
             st = time.time()
 
             try:
-                if m.video or os.path.splitext(f)[1].lower() == '.mp4':
+                if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']):
                     mtd = await get_video_metadata(f)
-                    dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                    th = await screenshot(f, dur, d)
-                    await c.send_video(tcid, video=f, caption=ft if m.caption else None, 
-                                    thumb=th, width=w, height=h, duration=dur, 
+                    dur, h, w = mtd.get('duration'), mtd.get('height'), mtd.get('width')
+                    th_for_upload = await screenshot(f, dur or 1, d) if not th else th # Use existing thumb or create new
+                    await c.send_video(tcid, video=f, caption=ft, 
+                                    thumb=th_for_upload, width=w, height=h, duration=dur, 
                                     progress=prog, progress_args=(c, d, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.video_note:
@@ -312,34 +351,52 @@ async def process_msg(c, u, m, d, lt, uid, i):
                     await c.send_voice(tcid, f, progress=prog, progress_args=(c, d, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.sticker:
-                    await c.send_sticker(tcid, m.sticker.file_id)
+                    await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid) # Stickers are sent by file_id, not path
                 elif m.audio:
-                    await c.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
-                                    thumb=th, progress=prog, progress_args=(c, d, p.id, st), 
+                    th_for_upload = th # Use existing thumb
+                    await c.send_audio(tcid, audio=f, caption=ft, 
+                                    thumb=th_for_upload, progress=prog, progress_args=(c, d, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.photo:
-                    await c.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
+                    th_for_upload = th # Use existing thumb
+                    await c.send_photo(tcid, photo=f, caption=ft, 
                                     progress=prog, progress_args=(c, d, p.id, st), 
                                     reply_to_message_id=rtmid)
-                else:
-                    await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
+                else: # Default to document for other types or fallback
+                    th_for_upload = th # Use existing thumb
+                    await c.send_document(tcid, document=f, caption=ft, 
                                         progress=prog, progress_args=(c, d, p.id, st), 
                                         reply_to_message_id=rtmid)
             except Exception as e:
-                await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:30]}')
+                await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:50]}')
+                # Clean up temp screenshot if created
+                if th and os.path.exists(th) and th != f'{d}.jpg':
+                    os.remove(th)
                 if os.path.exists(f): os.remove(f)
                 return 'Failed.'
             
+            # Clean up temp screenshot if created
+            if th and os.path.exists(th) and th != f'{d}.jpg':
+                os.remove(th)
             os.remove(f)
             await c.delete_messages(d, p.id)
             
             return 'Done.'
             
         elif m.text:
-            await c.send_message(tcid, text=m.text.markdown, reply_to_message_id=rtmid)
-            return 'Sent.'
+            # Ensure m.text.markdown is not None, though generally it shouldn't be for a filters.text message
+            if m.text.markdown:
+                await c.send_message(tcid, text=m.text.markdown, reply_to_message_id=rtmid)
+                return 'Sent.'
+            else:
+                return 'No text found in message.'
+        else: # Handle messages that are neither media nor text
+            return 'Unsupported message type.'
     except Exception as e:
-        return f'Error: {str(e)[:50]}'
+        # Catch-all for any unhandled errors within process_msg
+        print(f"Error in process_msg for user {d}: {e}")
+        return f'Fatal Error: {str(e)[:50]}'
+
 
 @X.on_message(filters.command(['batch', 'single']))
 async def process_cmd(c, m):
