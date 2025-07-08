@@ -1,9 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
-
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from pyrogram.errors import BadRequest, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, MessageNotModified
 import logging
 import os
@@ -13,6 +9,7 @@ from utils.func import save_user_session, get_user_data, remove_user_session, sa
 from utils.encrypt import ecs, dcs
 from plugins.batch import UB, UC
 from utils.custom_filters import login_in_progress, set_user_step, get_user_step
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 model = "v3saver Team SPY"
@@ -26,15 +23,22 @@ login_cache = {}
 async def login_command(client, message):
     user_id = message.from_user.id
     set_user_step(user_id, STEP_PHONE)
-    login_cache.pop(user_id, None)
-    await message.delete()
+    login_cache.pop(user_id, None) # Clear any previous login attempt
+
+    # Create a keyboard with a request_contact button
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("Share My Phone Number", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await message.delete() # Delete the /login command message
     status_msg = await message.reply(
-        """Please send your phone number with country code
-Example: `+12345678900`"""
-        )
+        """Please share your phone number by clicking the button below. This will securely send your contact to me.""",
+        reply_markup=keyboard
+    )
     login_cache[user_id] = {'status_msg': status_msg}
-    
-    
+
 @bot.on_message(filters.command("setbot"))
 async def set_bot_token(C, m):
     user_id = m.from_user.id
@@ -44,13 +48,13 @@ async def set_bot_token(C, m):
             await UB[user_id].stop()
             if UB.get(user_id, None):
                 del UB[user_id]  # Remove from dictionary
-                
+
             try:
                 if os.path.exists(f"user_{user_id}.session"):
                     os.remove(f"user_{user_id}.session")
             except Exception:
                 pass
-            
+
             print(f"Stopped and removed old bot for user {user_id}")
         except Exception as e:
             print(f"Error stopping old bot for user {user_id}: {e}")
@@ -63,15 +67,14 @@ async def set_bot_token(C, m):
     bot_token = args[1].strip()
     await save_user_bot(user_id, bot_token)
     await m.reply_text("✅ Bot token saved successfully.", quote=True)
-    
-    
+
 @bot.on_message(filters.command("rembot"))
 async def rem_bot_token(C, m):
     user_id = m.from_user.id
     if user_id in UB:
         try:
             await UB[user_id].stop()
-            
+
             if UB.get(user_id, None):
                 del UB[user_id]  # Remove from dictionary # Remove from dictionary
             print(f"Stopped and removed old bot for user {user_id}")
@@ -92,53 +95,55 @@ async def rem_bot_token(C, m):
     await remove_user_bot(user_id)
     await m.reply_text("✅ Bot token removed successfully.", quote=True)
 
-    
-@bot.on_message(login_in_progress & filters.text & filters.private & ~filters.command([
+@bot.on_message(login_in_progress & filters.private & ~filters.command([
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 'pay',
     'redeem', 'gencode', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
 async def handle_login_steps(client, message):
     user_id = message.from_user.id
-    text = message.text.strip()
     step = get_user_step(user_id)
     try:
         await message.delete()
     except Exception as e:
         logger.warning(f'Could not delete message: {e}')
+
     status_msg = login_cache[user_id].get('status_msg')
     if not status_msg:
         status_msg = await message.reply('Processing...')
         login_cache[user_id]['status_msg'] = status_msg
+
     try:
         if step == STEP_PHONE:
-            if not text.startswith('+'):
-                await edit_message_safely(status_msg,
-                    '❌ Please provide a valid phone number starting with +')
-                return
-            await edit_message_safely(status_msg,
-                '🔄 Processing phone number...')
-            temp_client = Client(f'temp_{user_id}', api_id=API_ID, api_hash
-                =API_HASH, device_model=model, in_memory=True)
-            try:
-                await temp_client.connect()
-                sent_code = await temp_client.send_code(text)
-                login_cache[user_id]['phone'] = text
-                login_cache[user_id]['phone_code_hash'
-                    ] = sent_code.phone_code_hash
-                login_cache[user_id]['temp_client'] = temp_client
-                set_user_step(user_id, STEP_CODE)
-                await edit_message_safely(status_msg,
-                    """✅ Verification code sent to your Telegram account.
-                    
+            if message.contact: # Check if the message contains contact information
+                phone_number = message.contact.phone_number
+                await edit_message_safely(status_msg, '🔄 Processing phone number...')
+
+                # Remove the keyboard after receiving the contact
+                await status_msg.edit_reply_markup(reply_markup=ReplyKeyboardRemove())
+
+                temp_client = Client(f'temp_{user_id}', api_id=API_ID, api_hash=API_HASH, device_model=model, in_memory=True)
+                try:
+                    await temp_client.connect()
+                    sent_code = await temp_client.send_code(phone_number)
+                    login_cache[user_id]['phone'] = phone_number
+                    login_cache[user_id]['phone_code_hash'] = sent_code.phone_code_hash
+                    login_cache[user_id]['temp_client'] = temp_client
+                    set_user_step(user_id, STEP_CODE)
+                    await edit_message_safely(status_msg,
+                        """✅ Verification code sent to your Telegram account.
+
 Please enter the code you received like 1 2 3 4 5 (i.e seperated by space):"""
                     )
-            except BadRequest as e:
-                await edit_message_safely(status_msg,
-                    f"""❌ Error: {str(e)}
+                except BadRequest as e:
+                    await edit_message_safely(status_msg,
+                        f"""❌ Error: {str(e)}
 Please try again with /login.""")
-                await temp_client.disconnect()
-                set_user_step(user_id, None)
+                    await temp_client.disconnect()
+                    set_user_step(user_id, None)
+            else:
+                await edit_message_safely(status_msg,
+                    '❌ Please share your phone number by clicking the button, or use /cancel to stop.')
         elif step == STEP_CODE:
-            code = text.replace(' ', '')
+            code = message.text.strip().replace(' ', '') # Use message.text for the code
             phone = login_cache[user_id]['phone']
             phone_code_hash = login_cache[user_id]['phone_code_hash']
             temp_client = login_cache[user_id]['temp_client']
@@ -173,7 +178,7 @@ Please enter your password:"""
             try:
                 await edit_message_safely(status_msg, '🔄 Verifying password...'
                     )
-                await temp_client.check_password(text)
+                await temp_client.check_password(message.text.strip()) # Use message.text for the password
                 session_string = await temp_client.export_session_string()
                 encrypted_session = ecs(session_string)
                 await save_user_session(user_id, encrypted_session)
@@ -198,6 +203,7 @@ Please try again with /login.""")
             await login_cache[user_id]['temp_client'].disconnect()
         login_cache.pop(user_id, None)
         set_user_step(user_id, None)
+
 async def edit_message_safely(message, text):
     """Helper function to edit message and handle errors"""
     try:
@@ -206,7 +212,7 @@ async def edit_message_safely(message, text):
         pass
     except Exception as e:
         logger.error(f'Error editing message: {e}')
-        
+
 @bot.on_message(filters.command('cancel'))
 async def cancel_command(client, message):
     user_id = message.from_user.id
@@ -218,8 +224,10 @@ async def cancel_command(client, message):
         login_cache.pop(user_id, None)
         set_user_step(user_id, None)
         if status_msg:
+            # Also remove the keyboard if it's still there
             await edit_message_safely(status_msg,
-                '✅ Login process cancelled. Use /login to start again.')
+                '✅ Login process cancelled. Use /login to start again.',
+                reply_markup=ReplyKeyboardRemove())
         else:
             temp_msg = await message.reply(
                 '✅ Login process cancelled. Use /login to start again.')
@@ -227,7 +235,7 @@ async def cancel_command(client, message):
     else:
         temp_msg = await message.reply('No active login process to cancel.')
         await temp_msg.delete(5)
-        
+
 @bot.on_message(filters.command('logout'))
 async def logout_command(client, message):
     user_id = message.from_user.id
@@ -235,7 +243,7 @@ async def logout_command(client, message):
     status_msg = await message.reply('🔄 Processing logout request...')
     try:
         session_data = await get_user_data(user_id)
-        
+
         if not session_data or 'session_string' not in session_data:
             await edit_message_safely(status_msg,
                 '❌ No active session found for your account.')
